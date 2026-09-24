@@ -1,0 +1,8 @@
+# This placeholder keeps the music/ folder in version control.
+#
+# AUDIO POLICY (version 1.2): the audio files that belong here
+# (currently music/menu_theme.mp3) are NOT stored in git. Place them
+# on disk manually from your external audio storage before compiling
+# a release. The build embeds this whole folder via `#pragma asset
+# "music"`, so an empty folder compiles cleanly and the game simply
+# runs without menu music until the file is provided.

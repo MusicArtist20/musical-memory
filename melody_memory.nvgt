@@ -1,0 +1,460 @@
+// melody_memory.nvgt - Stage 1 of an accessible, audio-only musical puzzle game.
+// Melody Memory: listen to a sequence of musical notes, then repeat it by ear
+// on your number row (1-8). Each round the melody grows by one note.
+//
+// Menu: Play (Single Player / Multiplayer), Continue (when a game is in
+//       progress), Game Settings, Test Speakers, Exit. Menu background music
+//       loops while the menu is open. In version 1.2, both Play options are
+//       temporarily on hold and announce a maintenance / coming soon notice
+//       instead of starting gameplay (multiplayer servers are not deployed
+//       yet, and the single-player audio assets are still pending).
+//
+// Requires NVGT 0.9.x or newer. Compile with: nvgt -c melody_memory.nvgt
+//
+// AUDIO ASSET POLICY (version 1.2): no audio files are stored in version
+// control. Add music/sfx locally before building a release; the .gitignore
+// blocks .wav/.mp3/.ogg etc. Everything else in this project is
+// engine-agnostic or procedurally synthesized (see include/tone_utils.nvgt).
+// The only audio reference is music/menu_theme.mp3, loaded by
+// include/menu_music.nvgt, which degrades gracefully if the file is missing.
+
+#include "include/tone_utils.nvgt"
+#include "include/menu_music.nvgt"
+#include "menu.nvgt"
+#include "settings.nvgt"
+
+// Copy the menu music into the compiled bundle so it ships with the game.
+// The music/ folder (not an individual file) is bundled: audio files are
+// kept OUT of version control (see .gitignore) and are only placed on disk
+// locally by whoever builds a release. The pragma therefore compiles on any
+// fresh clone (empty folder = nothing embedded), and menu_music.nvgt already
+// runs silently and without errors when the track is not present.
+#pragma asset "music"
+
+// ---------------------------------------------------------------------------
+// Game state / constants
+// ---------------------------------------------------------------------------
+
+// Version 1.2: gameplay entry is temporarily on hold. Selecting Single Player
+// or Multiplayer announces this notice instead of starting the game.
+const string PLAY_HOLD_NOTICE = "Coming soon. This mode is under maintenance while the online servers and audio assets are prepared. Returning you to the main menu.";
+
+const int MAX_MELODY = 24;          // Maximum melody length (win condition).
+const int BASE_ROUND_DELAY_MS = 900; // Base gap between notes in a round (ms).
+const int MAX_ROUND_DELAY_MS = 1800; // Cap so late rounds stay playable.
+
+// Scale degrees played on keys 1-8: one octave of C major starting at C4.
+const string[] SCALE_NOTES = {"c4", "d4", "e4", "f4", "g4", "a4", "b4", "c5"};
+
+// Settings persistence (JSON so it stays human-readable).
+settings game_settings;
+settings game_save;
+
+// Menu background music (see include/menu_music.nvgt). One instance is reused
+// for the whole run, so menu music can never stack up duplicate copies.
+menu_music_player menu_music;
+
+// Runtime configuration (loaded from settings, adjusted in Game Settings).
+double note_gap_percent = 100; // 60 = fast, 100 = normal, 200 = slow.
+bool spoken_labels = true;     // Speak note names (do, re, mi...) after each tone.
+
+// Saved-game state.
+int saved_round = 0;           // Round the player reached (0 = no game in progress).
+int saved_lives = 3;
+
+int round_number_current = 1; // Round being played right now, used for pacing.
+
+// Speech: the speech.nvgt include (pulled in by menu.nvgt) provides the
+// `speak`, `stop_speech` functions and the global `tts` voice.
+
+// ---------------------------------------------------------------------------
+// Settings / save data
+// ---------------------------------------------------------------------------
+void load_settings() {
+	if (!game_settings.setup("MelodyMemory", "Stage1", true, "json")) {
+		speak("Warning: could not open the settings file. Using defaults.");
+		return;
+	}
+	note_gap_percent = game_settings.read_number("note_gap_percent", 100);
+	spoken_labels = game_settings.read_bool("spoken_labels", true);
+	if (note_gap_percent < 50) note_gap_percent = 50;
+	if (note_gap_percent > 250) note_gap_percent = 250;
+	// Music volume is stored as a 0..100 percentage, independent of game sounds.
+	menu_music.set_volume_percent(int(game_settings.read_number("music_volume", MUSIC_VOLUME_DEFAULT)));
+}
+
+void save_settings() {
+	game_settings.write_number("note_gap_percent", note_gap_percent);
+	game_settings.write_bool("spoken_labels", spoken_labels);
+	game_settings.write_number("music_volume", menu_music.volume_percent);
+	game_settings.dump();
+}
+
+void load_save() {
+	saved_round = 0;
+	saved_lives = 3;
+	if (!game_save.setup("MelodyMemory", "Stage1Save", true, "json")) return;
+	if (!game_save.exists("round")) return;
+	double r = game_save.read_number("round", 0);
+	if (r >= 1) saved_round = int(r);
+	saved_lives = int(game_save.read_number("lives", 3));
+}
+
+void write_save(int round, int lives) {
+	if (!game_save.active) {
+		if (!game_save.setup("MelodyMemory", "Stage1Save", true, "json")) return;
+	}
+	game_save.write_number("round", round);
+	game_save.write_number("lives", lives);
+	game_save.dump();
+}
+
+void clear_save() {
+	if (game_save.active) game_save.clear(true);
+	saved_round = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Speaker test
+// ---------------------------------------------------------------------------
+void speaker_test() {
+	speak("Speaker test. You should hear a short rising chord on all speakers. Press any key to repeat it, or escape to return to the main menu.", true);
+	string wav_path = "speaker_test.wav";
+	if (!generate_test_chord_wav(wav_path)) {
+		speak("Could not generate the test sound.");
+		wait(1200);
+		return;
+	}
+	while (true) {
+		sound test;
+		if (!test.load(wav_path)) {
+			speak("Could not load the test sound.");
+			wait(1200);
+			return;
+		}
+		test.play();
+		// Wait for either a key press or the end of the sound.
+		while (test.playing and !any_key_pressed()) wait(5);
+		stop_speech();
+		if (key_pressed(KEY_ESCAPE)) {
+			test.stop();
+			file_delete(wav_path);
+			return;
+		}
+		wait(150);
+	}
+}
+
+// Returns true if any key was pressed since the last check.
+bool any_key_pressed() {
+	for (int k = 1; k < 320; k++) {
+		if (key_pressed(k)) return true;
+	}
+	return false;
+}
+
+// ---------------------------------------------------------------------------
+// Gameplay: Melody Memory
+// ---------------------------------------------------------------------------
+int imin(int a, int b) {
+	if (a < b) return a;
+	return b;
+}
+
+int round_gap_ms() {
+	// Later rounds get slightly slower pacing; user speed setting scales it.
+	int extra = imin(round_number_current * 15, 400);
+	int gap = int((BASE_ROUND_DELAY_MS + extra) * note_gap_percent / 100.0);
+	if (gap > MAX_ROUND_DELAY_MS) gap = MAX_ROUND_DELAY_MS;
+	return gap;
+}
+
+void play_melody(int[] melody, int length) {
+	int gap = round_gap_ms();
+	speak("Listen.", true);
+	wait(400);
+	for (int i = 0; i < length; i++) {
+		play_note_immediate(SCALE_NOTES[melody[i]], 0.5, 1, -6);
+		wait(gap);
+	}
+}
+
+void announce_notes(int[] melody, int length) {
+	if (!spoken_labels) return;
+	for (int i = 0; i < length; i++) {
+		speak(note_display_name(melody[i]), true);
+		wait(700);
+	}
+}
+
+// Returns true if the player survived the round.
+bool play_round(int round_number, int[] melody, int lives_left) {
+	round_number_current = round_number;
+	speak("Round " + round_number + ". " + lives_left + (lives_left == 1 ? " life" : " lives") + " remaining.");
+	play_melody(melody, round_number);
+	if (spoken_labels) speak("Repeat the melody using the number keys one through eight. Press h for help.", true);
+	else speak("Repeat the melody using the number keys one through eight.", true);
+	int correct_in_a_row = 0;
+	while (correct_in_a_row < round_number) {
+		if (key_pressed(KEY_ESCAPE)) {
+			speak("Round abandoned.");
+			return false;
+		}
+		if (key_pressed(KEY_H)) {
+			speak("Press number keys one through eight to repeat the melody. Press r to hear it again. Press l to hear the note names. Press escape to give up this round.", true);
+			while (key_pressed(KEY_H)) wait(5);
+		}
+		if (key_pressed(KEY_R)) {
+			play_melody(melody, round_number);
+			if (spoken_labels) speak("Repeating. Continue with the number keys.", true);
+			while (key_pressed(KEY_R)) wait(5);
+		}
+		if (key_pressed(KEY_L)) {
+			announce_notes(melody, round_number);
+			while (key_pressed(KEY_L)) wait(5);
+		}
+		for (int k = 0; k < 8; k++) {
+			if (!key_pressed(KEY_1 + k)) continue;
+			while (key_pressed(KEY_1 + k)) wait(5); // Wait for release, single input per press.
+			if (k == melody[correct_in_a_row]) {
+				correct_in_a_row++;
+				play_note_immediate(SCALE_NOTES[k], 0.35, 1, -6);
+				if (correct_in_a_row == round_number) {
+					speak("Correct! Melody complete.");
+					return true;
+				}
+			} else {
+				play_note_immediate("c3", 0.6, 2, -10); // Low buzz on a wrong note.
+				speak("Wrong note. That was " + note_display_name(melody[correct_in_a_row]) + ".");
+				return false;
+			}
+		}
+		wait(5); // Mandatory in every main-style loop.
+	}
+	return true;
+}
+
+// Returns the round reached when the game ends.
+int play_game(int start_round, int lives) {
+	int[] melody(MAX_MELODY);
+	int round = start_round;
+	while (true) {
+		// Generate this round's melody: keep the first (round-1) notes from the
+		// previous round stable, append one new random note at the end.
+		for (int i = round - 1; i < round; i++) {
+			melody[i] = random(0, 7);
+		}
+		bool survived = play_round(round, melody, lives);
+		if (!survived) {
+			lives--;
+			if (lives <= 0) {
+				speak("Game over. You reached round " + round + ".");
+				return round;
+			}
+			speak("You lost a life. " + lives + (lives == 1 ? " life" : " lives") + " remaining.");
+			// Rebuild the melody for the retry of the same round.
+			for (int i = 0; i < round; i++) melody[i] = random(0, 7);
+		} else {
+			if (round >= MAX_MELODY) {
+				speak("Incredible! You completed the full " + MAX_MELODY + " note melody. You win!");
+				return round;
+			}
+			round++;
+			write_save(round, lives);
+			speak("Progress saved.");
+		}
+		wait(300);
+	}
+	return round; // Never reached; satisfies the compiler that all paths return.
+}
+
+// ---------------------------------------------------------------------------
+// Game Settings menu
+// ---------------------------------------------------------------------------
+void game_settings_menu() {
+	menu m;
+	m.intro_text = "Game settings. Choose an option, or press escape to go back.";
+	m.wrap = true;
+	m.click_sound = "";
+	m.select_sound = "";
+	update_settings_menu(m);
+	int choice = -1;
+	bool stay = true;
+	while (stay) {
+		choice = m.run();
+		if (choice < 0) { // Escape pressed.
+			stay = false;
+		} else if (choice == 0) { // Speed
+			adjust_speed();
+			update_settings_menu(m);
+		} else if (choice == 1) { // Music volume
+			choose_music_volume();
+			update_settings_menu(m);
+		} else if (choice == 2) { // Spoken labels toggle
+			spoken_labels = !spoken_labels;
+			save_settings();
+			speak(spoken_labels ? "Note names on." : "Note names off.");
+			update_settings_menu(m);
+		} else if (choice == 3) { // Reset progress
+			reset_progress_confirm();
+			update_settings_menu(m);
+		}
+	}
+	speak("Returning to the main menu.");
+}
+
+void update_settings_menu(menu@ m) {
+	// Rebuild the item list with current values so labels always speak fresh state.
+	m.delete_all_items();
+	m.add_item("Note speed: " + speed_name());
+	m.add_item("Music volume: " + music_volume_name(menu_music.volume_percent));
+	m.add_item("Speak note names: " + (spoken_labels ? "on" : "off"));
+	m.add_item("Reset saved progress");
+}
+
+string speed_name() {
+	if (note_gap_percent <= 75) return "fast";
+	if (note_gap_percent <= 125) return "normal";
+	if (note_gap_percent <= 175) return "slow";
+	return "very slow";
+}
+
+void adjust_speed() {
+	string[] options = {"Fast", "Normal", "Slow", "Very slow"};
+	menu sm;
+	sm.intro_text = "Choose a note speed.";
+	sm.wrap = true;
+	for (uint i = 0; i < options.length(); i++) sm.add_item(options[i]);
+	int pick = sm.run();
+	if (pick == 0) note_gap_percent = 60;
+	else if (pick == 1) note_gap_percent = 100;
+	else if (pick == 2) note_gap_percent = 150;
+	else if (pick == 3) note_gap_percent = 220;
+	if (pick >= 0) {
+		save_settings();
+		speak("Speed set to " + options[pick].lower() + ".");
+	}
+}
+
+// Music volume is a separate setting from the game sound effects. Applying it
+// live lets the player hear the change without leaving this screen.
+void choose_music_volume() {
+	menu vm;
+	vm.intro_text = "Music volume. This changes only the menu music, not the game sounds. Press escape to keep the current level.";
+	vm.wrap = true;
+	for (uint i = 0; i < MUSIC_VOLUME_NAMES.length(); i++) vm.add_item(MUSIC_VOLUME_NAMES[i]);
+	int pick = vm.run();
+	if (pick < 0) return; // Escape: keep the current volume.
+	menu_music.set_volume_percent(MUSIC_VOLUME_PERCENTS[pick]);
+	save_settings();
+	if (MUSIC_VOLUME_PERCENTS[pick] == 0) speak("Menu music off.");
+	else speak("Music volume " + MUSIC_VOLUME_NAMES[pick].lower() + ".");
+}
+
+void reset_progress_confirm() {
+	if (saved_round <= 0) {
+		speak("There is no saved progress to reset.");
+		return;
+	}
+	menu cm;
+	cm.intro_text = "Are you sure you want to reset your saved progress? This cannot be undone.";
+	cm.wrap = true;
+	cm.add_item("Yes, delete my progress");
+	cm.add_item("No, keep it");
+	int pick = cm.run();
+	if (pick == 0) {
+		clear_save();
+		speak("Saved progress deleted.");
+	} else {
+		speak("Progress kept.");
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Play sub-menu (version 1.2)
+// The main "Play" button presents two sub-options: Single Player and
+// Multiplayer. Neither starts a game yet: single-player audio assets are
+// still pending and the multiplayer servers are not deployed, so each option
+// announces the hold notice and control returns to the main menu.
+// ---------------------------------------------------------------------------
+
+// Announces the maintenance / coming soon notice for a held play mode.
+void announce_play_hold(const string&in mode_id) {
+	if (mode_id == "single_player") {
+		speak("Single player.");
+	} else if (mode_id == "multiplayer") {
+		speak("Multiplayer.");
+	}
+	// One unified announcement pop-up (spoken + braille via speak) for both
+	// modes; no gameplay may start from here until assets and servers land.
+	speak(PLAY_HOLD_NOTICE, false);
+	wait(300); // Let the notice start before the menu re-announces itself.
+}
+
+// Play sub-menu. Returns the selected mode's id ("single_player" or
+// "multiplayer"), or "" if the user pressed escape to go back.
+string play_menu() {
+	menu pm;
+	pm.wrap = true;
+	pm.intro_text = "Play. Choose a mode, or press escape to go back.";
+	pm.add_item("Single player", "single_player");
+	pm.add_item("Multiplayer", "multiplayer");
+	pm.run();
+	return pm.get_selected_item_id();
+}
+
+// ---------------------------------------------------------------------------
+// Main menu
+// Order: Play, Continue (only when progress exists), Game Settings,
+// Test Speakers, Exit. Returns the selected item's id ("" on escape).
+// ---------------------------------------------------------------------------
+string main_menu(bool game_in_progress) {
+	menu m;
+	m.wrap = true;
+	m.intro_text = "Welcome to Melody Memory, version 1.2. Choose an option with the arrow keys and press enter.";
+	m.add_item("Play", "play");
+	if (game_in_progress) m.add_item("Continue, round " + saved_round, "continue");
+	m.add_item("Game settings", "settings");
+	m.add_item("Test speakers", "speakers");
+	m.add_item("Exit", "exit");
+	m.run();
+	return m.get_selected_item_id();
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+void main() {
+	load_settings();
+	load_save();
+	show_window("Melody Memory 1.2 - Stage 1");
+	bool running = true;
+	while (running) {
+		bool has_save = saved_round >= 1;
+		// Menu background music. start() is idempotent, so returning to the menu
+		// resumes the same single instance rather than creating a new one.
+		menu_music.start();
+		string choice = main_menu(has_save);
+		if (choice == "play") { // Play sub-menu (Single Player / Multiplayer).
+			string play_choice = play_menu();
+			// Escape ("") goes back silently; either held mode gets the notice.
+			if (play_choice != "") announce_play_hold(play_choice);
+		} else if (choice == "continue" and has_save) { // Continue
+			// Version 1.2: gameplay is on hold (audio assets pending), so even a
+			// saved game announces the same notice instead of starting a run.
+			announce_play_hold("single_player");
+		} else if (choice == "settings") { // Game settings stay on the menu, so music keeps playing here.
+			game_settings_menu();
+		} else if (choice == "speakers") { // Test speakers
+			menu_music.stop(); // Music would interfere with the speaker test.
+			speaker_test();
+		} else { // Exit, or escape pressed on the main menu.
+			menu_music.stop();
+			running = false;
+		}
+		if (!game_save.active) load_save(); // Refresh has_save state each loop.
+	}
+	speak("Thank you for playing Melody Memory. Goodbye!");
+	wait(800);
+	exit(0);
+}

@@ -1,0 +1,105 @@
+/* menu_music.nvgt - menu background music for Melody Memory.
+ *
+ * Everything about the menu track lives here:
+ *   - MENU_MUSIC_FILE is the ONE place the filename appears. Swap the track by
+ *     replacing music/menu_theme.mp3 (or by editing this single line). Menu
+ *     logic never needs to change to change the song.
+ *   - The track is loaded once, loops forever, and a single sound object is
+ *     reused, so returning to the menu can never stack up duplicate copies.
+ *   - Music volume is a 0..100 percentage kept independent of every game
+ *     sound effect, and is applied through one function (music_volume_db).
+ *   - If the file is missing, the game keeps running silently with no errors.
+ */
+
+// The only reference to the music asset. Replace the file or this line.
+const string MENU_MUSIC_FILE = "music/menu_theme.mp3";
+
+// Default music level as a 0..100 percentage (independent of sound effects).
+const int MUSIC_VOLUME_DEFAULT = 60;
+
+// Friendly, screen-reader-first volume choices. Kept as parallel arrays so the
+// settings menu can speak a label while we store a precise percentage.
+const string[] MUSIC_VOLUME_NAMES = {"Off", "Very quiet", "Quiet", "Medium", "Loud", "Full"};
+const int[] MUSIC_VOLUME_PERCENTS = {0, 15, 30, 55, 80, 100};
+
+// Convert a 0..100 music percentage into the decibel scale the audio engine
+// uses (0 dB is unattenuated, negative values are quieter). One conversion
+// function means the volume curve is never duplicated in the code.
+float music_volume_db(int percent) {
+	if (percent <= 0) return -96.0;   // Effectively silent, still "playing".
+	if (percent >= 100) return 0.0;
+	return float(20.0 * log10(double(percent) / 100.0));
+}
+
+// Nearest friendly label for a stored percentage (used for menu speech).
+string music_volume_name(int percent) {
+	int best = 0;
+	int best_distance = 1000;
+	for (uint i = 0; i < MUSIC_VOLUME_PERCENTS.length(); i++) {
+		int d = percent - MUSIC_VOLUME_PERCENTS[i];
+		if (d < 0) d = -d;
+		if (d < best_distance) {
+			best_distance = d;
+			best = int(i);
+		}
+	}
+	return MUSIC_VOLUME_NAMES[best];
+}
+
+class menu_music_player {
+	sound@ track = null;
+	bool load_attempted = false;
+	bool available = false;
+	int volume_percent = MUSIC_VOLUME_DEFAULT;
+
+	// Load the track lazily and exactly once. Missing file = silent, no error.
+	void ensure_loaded() {
+		if (load_attempted) return;
+		load_attempted = true;
+		if (!file_exists(MENU_MUSIC_FILE)) return;
+		@track = sound();
+		if (!track.load(MENU_MUSIC_FILE)) { // load() streams then preloads.
+			@track = null;
+			return;
+		}
+		track.looping = true; // Loop continuously while the menu is open.
+		available = true;
+		apply_volume();
+	}
+
+	void apply_volume() {
+		if (!available or @track == null) return;
+		track.volume = music_volume_db(volume_percent);
+	}
+
+	// Independent music volume. Applies live so the settings menu is audible.
+	void set_volume_percent(int percent) {
+		if (percent < 0) percent = 0;
+		if (percent > 100) percent = 100;
+		volume_percent = percent;
+		apply_volume();
+	}
+
+	// Read-only: true while the menu music is actually sounding.
+	bool get_playing() const property {
+		if (!available or @track == null) return false;
+		return track.playing;
+	}
+
+	// Idempotent: safe to call on every menu entry. If the music is already
+	// playing this does nothing, so there is never more than one instance.
+	void start() {
+		ensure_loaded();
+		if (!available or @track == null) return;
+		if (track.playing) return;
+		track.seek_in_milliseconds(0); // Always restart from the top.
+		track.play();
+	}
+
+	// Idempotent stop used whenever the player leaves the menu.
+	void stop() {
+		if (!available or @track == null) return;
+		if (!track.playing) return;
+		track.stop();
+	}
+}

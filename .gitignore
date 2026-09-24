@@ -1,0 +1,81 @@
+# ============================================================================
+# Melody Memory - audio asset exclusion policy (version 1.2)
+# ----------------------------------------------------------------------------
+# Repository storage policy: NO audio assets are ever committed or pushed to
+# GitHub. All game audio is managed externally and must be placed on disk
+# manually before compiling a release bundle.
+#
+# BUILD NOTE: the build only embeds audio via `#pragma asset "music"` (the
+# whole folder). This folder is kept in git (via .gitkeep) but stays empty on
+# fresh clones, so the project always compiles. When the music file is absent
+# the game runs silently with no errors (include/menu_music.nvgt).
+#
+# NVGT-ONLY ENGINE POLICY: audio synthesis for gameplay (notes, speaker test)
+# is procedural via tone_synth in include/tone_utils.nvgt - those features
+# need no audio files at all and are unaffected by these rules.
+# ============================================================================
+
+# --- All audio formats, anywhere in the project ---
+# (covers every location: source tree, distribution folders, plugin
+# references - no audio file may ever be tracked, under any name)
+*.wav
+*.mp3
+*.ogg
+*.oga
+*.flac
+*.aac
+*.m4a
+*.wma
+*.opus
+*.mid
+*.midi
+*.aiff
+*.aif
+*.au
+*.wv
+*.it
+*.xm
+*.mod
+*.s3m
+
+# --- Compiled executables / binaries (never track build output) ---
+*.exe
+*.apk
+*.dmg
+*.app.zip
+
+# --- Compiled output: never tracked (rebuilt per release) ---
+# /melody_memory/ is the distribution folder (compiled exe + ~54MB of
+# bundled libraries); /MelodyMemory/ holds runtime settings/save data.
+/melody_memory/
+/MelodyMemory/
+
+# --- The music folder: structure only, contents always external ---
+# Rule matches ANY file placed here (including renamed copies like
+# menu_theme.mp3.bak that extension patterns would miss). Only the
+# .gitkeep placeholder is tracked so fresh clones keep the folder.
+/music/*
+!/music/.gitkeep
+
+# --- Distribution bundles ---
+# Built zips are release artifacts and have contained audio in the past;
+# they are never committed.
+*.zip
+
+# --- Vendored reference game dumps ---
+# nvgt-dev-plugin/skills/nvgt-dev/references/ contains full example games
+# including multi-hundred-MB sound packs (sounds.dat ~560MB, ~347MB) far
+# beyond GitHub's 100MB file limit and this repository's size policy. The
+# plugin's own skill docs and scripts (everything else) stay tracked.
+/nvgt-dev-plugin/skills/nvgt-dev/references/
+
+# --- Embedded repository ---
+# musical-memory/ carries its own .git; staging it from here would create
+# a broken embedded-repo entry instead of real content.
+/musical-memory/
+
+# --- Local tool state ---
+.freebuff/
+
+# --- Keep placeholder files that preserve required folders ---
+!**/.gitkeep

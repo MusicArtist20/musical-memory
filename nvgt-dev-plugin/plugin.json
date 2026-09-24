@@ -1,0 +1,9 @@
+{
+  "name": "nvgt-dev-plugin",
+  "version": "1.0.0",
+  "description": "Custom NVGT Development Plugin",
+  "author": {
+    "name": "ashu-choudhury"
+  },
+  "license": "Apache-2.0"
+}
