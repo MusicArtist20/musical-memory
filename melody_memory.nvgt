@@ -61,6 +61,7 @@ bool spoken_labels = true;     // Speak note names (do, re, mi...) after each to
 // Saved-game state.
 int saved_round = 0;           // Round the player reached (0 = no game in progress).
 int saved_lives = 3;
+int[] saved_melody;            // Notes of the saved game's melody, so Continue replays the same tune.
 
 int round_number_current = 1; // Round being played right now, used for pacing.
 
@@ -93,25 +94,41 @@ void save_settings() {
 void load_save() {
 	saved_round = 0;
 	saved_lives = 3;
+	saved_melody.resize(0);
 	if (!game_save.setup("MelodyMemory", "Stage1Save", true, "json")) return;
 	if (!game_save.exists("round")) return;
 	double r = game_save.read_number("round", 0);
 	if (r >= 1) saved_round = int(r);
 	saved_lives = int(game_save.read_number("lives", 3));
+	if (saved_lives < 1) saved_lives = 1;
+	// Melody is stored as a string of digits 0-7, one per note.
+	string notes = game_save.read_string("melody", "");
+	for (uint i = 0; i < notes.length() and i < uint(MAX_MELODY); i++) {
+		int n = parse_int(notes.substr(i, 1));
+		if (n < 0 or n > 7) break;
+		saved_melody.insert_last(n);
+	}
 }
 
-void write_save(int round, int lives) {
+void write_save(int round, int lives, int[]@ melody) {
 	if (!game_save.active) {
 		if (!game_save.setup("MelodyMemory", "Stage1Save", true, "json")) return;
 	}
+	string notes = "";
+	for (int i = 0; i < round and i < int(melody.length()); i++) notes += melody[i];
 	game_save.write_number("round", round);
 	game_save.write_number("lives", lives);
+	game_save.write_string("melody", notes);
 	game_save.dump();
+	saved_round = round;
+	saved_lives = lives;
 }
 
 void clear_save() {
 	if (game_save.active) game_save.clear(true);
 	saved_round = 0;
+	saved_lives = 3;
+	saved_melody.resize(0);
 }
 
 // ---------------------------------------------------------------------------
@@ -187,8 +204,24 @@ void announce_notes(int[] melody, int length) {
 	}
 }
 
-// Returns true if the player survived the round.
-bool play_round(int round_number, int[] melody, int lives_left) {
+// Outcome of a single round.
+enum round_result {
+	ROUND_FAILED,
+	ROUND_PASSED,
+	ROUND_QUIT // Player chose to leave for the main menu; costs no life.
+};
+
+// Asks before leaving a game in progress. Returns true if the player wants to quit.
+bool confirm_quit_to_menu() {
+	menu qm;
+	qm.intro_text = "Quit to the main menu? Your progress will be saved and you can continue later.";
+	qm.wrap = true;
+	qm.add_item("Yes, save and quit");
+	qm.add_item("No, keep playing");
+	return qm.run() == 0;
+}
+
+round_result play_round(int round_number, int[] melody, int lives_left) {
 	round_number_current = round_number;
 	speak("Round " + round_number + ". " + lives_left + (lives_left == 1 ? " life" : " lives") + " remaining.");
 	play_melody(melody, round_number);
@@ -197,11 +230,11 @@ bool play_round(int round_number, int[] melody, int lives_left) {
 	int correct_in_a_row = 0;
 	while (correct_in_a_row < round_number) {
 		if (key_pressed(KEY_ESCAPE)) {
-			speak("Round abandoned.");
-			return false;
+			if (confirm_quit_to_menu()) return ROUND_QUIT;
+			speak("Continuing. You have entered " + correct_in_a_row + " of " + round_number + " notes.", true);
 		}
 		if (key_pressed(KEY_H)) {
-			speak("Press number keys one through eight to repeat the melody. Press r to hear it again. Press l to hear the note names. Press escape to give up this round.", true);
+			speak("Press number keys one through eight to repeat the melody. Press r to hear it again. Press l to hear the note names. Press escape to save and quit to the main menu.", true);
 			while (key_pressed(KEY_H)) wait(5);
 		}
 		if (key_pressed(KEY_R)) {
@@ -221,46 +254,56 @@ bool play_round(int round_number, int[] melody, int lives_left) {
 				play_note_immediate(SCALE_NOTES[k], 0.35, 1, -6);
 				if (correct_in_a_row == round_number) {
 					speak("Correct! Melody complete.");
-					return true;
+					return ROUND_PASSED;
 				}
 			} else {
 				play_note_immediate("c3", 0.6, 2, -10); // Low buzz on a wrong note.
 				speak("Wrong note. That was " + note_display_name(melody[correct_in_a_row]) + ".");
-				return false;
+				return ROUND_FAILED;
 			}
 		}
 		wait(5); // Mandatory in every main-style loop.
 	}
-	return true;
+	return ROUND_PASSED;
 }
 
-// Returns the round reached when the game ends.
-int play_game(int start_round, int lives) {
+// Plays from start_round. prior_melody holds notes from a saved game (may be
+// empty); any notes it does not cover are generated fresh.
+// Returns the round reached when the game ends or the player quits.
+int play_game(int start_round, int lives, int[]@ prior_melody) {
 	int[] melody(MAX_MELODY);
+	// The melody is one fixed ladder: each round adds one note to the end and
+	// earlier notes never change, including across retries and saved games.
+	int generated = 0;
+	for (uint i = 0; i < prior_melody.length() and i < uint(MAX_MELODY); i++) melody[generated++] = prior_melody[i];
 	int round = start_round;
 	while (true) {
-		// Generate this round's melody: keep the first (round-1) notes from the
-		// previous round stable, append one new random note at the end.
-		for (int i = round - 1; i < round; i++) {
-			melody[i] = random(0, 7);
+		while (generated < round) melody[generated++] = random(0, 7);
+		round_result result = play_round(round, melody, lives);
+		if (result == ROUND_QUIT) {
+			write_save(round, lives, melody);
+			speak("Progress saved. Returning to the main menu.");
+			return round;
 		}
-		bool survived = play_round(round, melody, lives);
-		if (!survived) {
+		if (result == ROUND_FAILED) {
 			lives--;
 			if (lives <= 0) {
+				clear_save(); // A finished game must not be offered as Continue.
 				speak("Game over. You reached round " + round + ".");
 				return round;
 			}
-			speak("You lost a life. " + lives + (lives == 1 ? " life" : " lives") + " remaining.");
-			// Rebuild the melody for the retry of the same round.
-			for (int i = 0; i < round; i++) melody[i] = random(0, 7);
+			// Save immediately so quitting cannot restore the lost life.
+			write_save(round, lives, melody);
+			speak("You lost a life. " + lives + (lives == 1 ? " life" : " lives") + " remaining. Try the same melody again.");
 		} else {
 			if (round >= MAX_MELODY) {
+				clear_save();
 				speak("Incredible! You completed the full " + MAX_MELODY + " note melody. You win!");
 				return round;
 			}
 			round++;
-			write_save(round, lives);
+			while (generated < round) melody[generated++] = random(0, 7);
+			write_save(round, lives, melody);
 			speak("Progress saved.");
 		}
 		wait(300);
