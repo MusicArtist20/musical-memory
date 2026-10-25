@@ -3,7 +3,7 @@
 // on your number row (1-8). Each round the melody grows by one note.
 //
 // Menu: Play (Single Player / Multiplayer), Continue (when a game is in
-//       progress), Game Settings, Test Speakers, Exit. Menu background music
+//       progress), Game Settings, Exit. Menu background music
 //       loops while the menu is open. In version 1.2, both Play options are
 //       temporarily on hold and announce a maintenance / coming soon notice
 //       instead of starting gameplay (multiplayer servers are not deployed
@@ -129,45 +129,6 @@ void clear_save() {
 	saved_round = 0;
 	saved_lives = 3;
 	saved_melody.resize(0);
-}
-
-// ---------------------------------------------------------------------------
-// Speaker test
-// ---------------------------------------------------------------------------
-void speaker_test() {
-	speak("Speaker test. You should hear a short rising chord on all speakers. Press any key to repeat it, or escape to return to the main menu.", true);
-	string wav_path = "speaker_test.wav";
-	if (!generate_test_chord_wav(wav_path)) {
-		speak("Could not generate the test sound.");
-		wait(1200);
-		return;
-	}
-	while (true) {
-		sound test;
-		if (!test.load(wav_path)) {
-			speak("Could not load the test sound.");
-			wait(1200);
-			return;
-		}
-		test.play();
-		// Wait for either a key press or the end of the sound.
-		while (test.playing and !any_key_pressed()) wait(5);
-		stop_speech();
-		if (key_pressed(KEY_ESCAPE)) {
-			test.stop();
-			file_delete(wav_path);
-			return;
-		}
-		wait(150);
-	}
-}
-
-// Returns true if any key was pressed since the last check.
-bool any_key_pressed() {
-	for (int k = 1; k < 320; k++) {
-		if (key_pressed(k)) return true;
-	}
-	return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -449,7 +410,7 @@ string play_menu() {
 // ---------------------------------------------------------------------------
 // Main menu
 // Order: Play, Continue (only when progress exists), Game Settings,
-// Test Speakers, Exit. Returns the selected item's id ("" on escape).
+// Exit. Returns the selected item's id ("" on escape).
 // ---------------------------------------------------------------------------
 string main_menu(bool game_in_progress) {
 	menu m;
@@ -458,7 +419,6 @@ string main_menu(bool game_in_progress) {
 	m.add_item("Play", "play");
 	if (game_in_progress) m.add_item("Continue, round " + saved_round, "continue");
 	m.add_item("Game settings", "settings");
-	m.add_item("Test speakers", "speakers");
 	m.add_item("Exit", "exit");
 	m.run();
 	return m.get_selected_item_id();
@@ -488,9 +448,6 @@ void main() {
 			announce_play_hold("single_player");
 		} else if (choice == "settings") { // Game settings stay on the menu, so music keeps playing here.
 			game_settings_menu();
-		} else if (choice == "speakers") { // Test speakers
-			menu_music.stop(); // Music would interfere with the speaker test.
-			speaker_test();
 		} else { // Exit, or escape pressed on the main menu.
 			menu_music.stop();
 			running = false;
@@ -501,3 +458,4 @@ void main() {
 	wait(800);
 	exit(0);
 }
+
