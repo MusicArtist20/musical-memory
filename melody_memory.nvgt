@@ -1,17 +1,17 @@
 // melody_memory.nvgt - Stage 1 of an accessible, audio-only musical puzzle game.
-// Melody Memory: listen to a sequence of musical notes, then repeat it by ear
-// on your number row (1-8). Each round the melody grows by one note.
+// Melody Memory 2.0: listen to a sequence of musical notes, then repeat it by
+// ear on your number row (1-8). Each round the melody grows by one note.
 //
-// Menu: Play (Single Player / Multiplayer), Continue (when a game is in
-//       progress), Game Settings, Exit. Menu background music
-//       loops while the menu is open. In version 1.2, both Play options are
-//       temporarily on hold and announce a maintenance / coming soon notice
-//       instead of starting gameplay (multiplayer servers are not deployed
-//       yet, and the single-player audio assets are still pending).
+// Menu: Play (mini-game chooser listing Melody Echo), Continue (when a game
+//       is in progress), Game Settings, Exit. Menu background music
+//       loops while the menu is open. Version 2.0 still holds the main
+//       ladder gameplay (Single Player / Multiplayer) behind a coming soon
+//       notice; the first playable mini game, Melody Echo, lives in
+//       include/melody_echo.nvgt and is reachable from the Play dialog.
 //
 // Requires NVGT 0.9.x or newer. Compile with: nvgt -c melody_memory.nvgt
 //
-// AUDIO ASSET POLICY (version 1.2): no audio files are stored in version
+// AUDIO ASSET POLICY (version 2.0): no audio files are stored in version
 // control. Add music/sfx locally before building a release; the .gitignore
 // blocks .wav/.mp3/.ogg etc. Everything else in this project is
 // engine-agnostic or procedurally synthesized (see include/tone_utils.nvgt).
@@ -22,6 +22,7 @@
 #include "include/menu_music.nvgt"
 #include "menu.nvgt"
 #include "settings.nvgt"
+#include "include/melody_echo.nvgt"
 
 // Copy the menu music into the compiled bundle so it ships with the game.
 // The music/ folder (not an individual file) is bundled: audio files are
@@ -31,12 +32,17 @@
 // runs silently and without errors when the track is not present.
 #pragma asset "music"
 
+// Bundle the Melody Echo note recordings (audios/note01..note08.wav). Like
+// music/, this folder stays out of version control; whoever builds a release
+// must place the WAV files in audios/ locally before compiling.
+#pragma asset "audios"
+
 // ---------------------------------------------------------------------------
 // Game state / constants
 // ---------------------------------------------------------------------------
 
-// Version 1.2: gameplay entry is temporarily on hold. Selecting Single Player
-// or Multiplayer announces this notice instead of starting the game.
+// Version 2.0: the ladder gameplay (Single Player / Multiplayer) and the
+// Continue flow stay on hold and announce this notice instead of starting.
 const string PLAY_HOLD_NOTICE = "Coming soon. This mode is under maintenance while the online servers and audio assets are prepared. Returning you to the main menu.";
 
 const int MAX_MELODY = 24;          // Maximum melody length (win condition).
@@ -375,11 +381,11 @@ void reset_progress_confirm() {
 }
 
 // ---------------------------------------------------------------------------
-// Play sub-menu (version 1.2)
-// The main "Play" button presents two sub-options: Single Player and
-// Multiplayer. Neither starts a game yet: single-player audio assets are
-// still pending and the multiplayer servers are not deployed, so each option
-// announces the hold notice and control returns to the main menu.
+// Play dialog (mini-game chooser)
+// Melody Memory is the parent game; the Play button opens a chooser that
+// lists mini games only. Melody Memory itself is not a mini game, so it is
+// not listed here - currently the chooser offers exactly one mini game:
+// Melody Echo. More mini games slot into this dialog as they are written.
 // ---------------------------------------------------------------------------
 
 // Announces the maintenance / coming soon notice for a held play mode.
@@ -395,16 +401,15 @@ void announce_play_hold(const string&in mode_id) {
 	wait(300); // Let the notice start before the menu re-announces itself.
 }
 
-// Play sub-menu. Returns the selected mode's id ("single_player" or
-// "multiplayer"), or "" if the user pressed escape to go back.
-string play_menu() {
-	menu pm;
-	pm.wrap = true;
-	pm.intro_text = "Play. Choose a mode, or press escape to go back.";
-	pm.add_item("Single player", "single_player");
-	pm.add_item("Multiplayer", "multiplayer");
-	pm.run();
-	return pm.get_selected_item_id();
+// Mini-game chooser. The intro text announces "Choose game" for NVDA.
+// Returns the selected game's id, or "" if the user pressed escape.
+string choose_game_menu() {
+	menu gm;
+	gm.wrap = true;
+	gm.intro_text = "Choose game. Select a mini game with the arrow keys, or press escape to go back.";
+	gm.add_item("Melody Echo", "melody_echo");
+	gm.run();
+	return gm.get_selected_item_id();
 }
 
 // ---------------------------------------------------------------------------
@@ -415,7 +420,7 @@ string play_menu() {
 string main_menu(bool game_in_progress) {
 	menu m;
 	m.wrap = true;
-	m.intro_text = "Welcome to Melody Memory, version 1.2. Choose an option with the arrow keys and press enter.";
+	m.intro_text = "Welcome to Melody Memory, version 2.0. Choose an option with the arrow keys and press enter.";
 	m.add_item("Play", "play");
 	if (game_in_progress) m.add_item("Continue, round " + saved_round, "continue");
 	m.add_item("Game settings", "settings");
@@ -430,7 +435,7 @@ string main_menu(bool game_in_progress) {
 void main() {
 	load_settings();
 	load_save();
-	show_window("Melody Memory 1.2 - Stage 1");
+	show_window("Melody Memory 2.0 - Stage 1");
 	bool running = true;
 	while (running) {
 		bool has_save = saved_round >= 1;
@@ -438,10 +443,13 @@ void main() {
 		// resumes the same single instance rather than creating a new one.
 		menu_music.start();
 		string choice = main_menu(has_save);
-		if (choice == "play") { // Play sub-menu (Single Player / Multiplayer).
-			string play_choice = play_menu();
-			// Escape ("") goes back silently; either held mode gets the notice.
-			if (play_choice != "") announce_play_hold(play_choice);
+		if (choice == "play") { // Mini-game chooser (currently Melody Echo only).
+			string game_choice = choose_game_menu();
+			if (game_choice == "melody_echo") {
+				menu_music.stop(); // Menu music would sit under the game notes.
+				play_melody_echo();
+			}
+			// Escape ("") or an unknown id just returns to the main menu.
 		} else if (choice == "continue" and has_save) { // Continue
 			// Version 1.2: gameplay is on hold (audio assets pending), so even a
 			// saved game announces the same notice instead of starting a run.

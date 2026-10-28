@@ -1,5 +1,5 @@
 /* tone_utils.nvgt - tone_synth helpers for Melody Memory.
- * Note playback and a synthesized chord used by the speaker test.
+ * Note playback used by gameplay and settings feedback.
  * All synthesis is procedural - no audio files required.
  */
 
@@ -20,21 +20,6 @@ void play_note_immediate(const string&in note_name, double beats = 0.45, int wav
 	// destruction is deferred until playback finishes.
 	s.autoclose = true;
 	s.play();
-}
-
-// A short rising arpeggio chord (c-e-g-c) used as the speaker-test sound.
-// Writes a WAV file next to the game executable so the user can also inspect it.
-bool generate_test_chord_wav(const string&in filename) {
-	tone_synth synth;
-	synth.set_tempo(150);
-	synth.set_volume(-8);
-	synth.set_waveform_type(1); // BGT type 1, modern tone engine wave 3
-	synth.set_edge_fades(15, 250);
-	synth.note("c4", 0.5);
-	synth.note("e4", 0.5);
-	synth.note("g4", 0.5);
-	synth.note("c5", 0.9);
-	return synth.write_wave_file(filename);
 }
 
 // Human-readable note names used by speech feedback during gameplay.

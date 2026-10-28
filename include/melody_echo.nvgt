@@ -1,0 +1,408 @@
+// melody_echo.nvgt - five-round recorded-note sequence game.
+// This mini-game is deliberately independent of Melody Memory's existing
+// ladder game and save data.
+//
+// Performance notes (fixed after user-reported lag and crashes):
+//   - Input voices are pooled: each response voice keeps its loaded note file,
+//     so a key press plays an already-loaded sample instead of loading a WAV
+//     from the bundled assets on every single press.
+//   - The sequence is played with a fixed spacing between note starts instead
+//     of waiting for every recording to finish (the recordings are 2-8 seconds
+//     long, most of it a long reverberant tail), which used to create a huge
+//     silence between notes.
+//   - Repeating the same note in a sequence is allowed: the sample restarts.
+
+const int MELODY_ECHO_ROUNDS = 5;
+const int MELODY_ECHO_CHANCES = 3; // Attempts allowed per round before restart.
+const int MELODY_ECHO_SEQUENCE_LENGTH = 3; // Proposed default; edit here.
+const int MELODY_ECHO_STAGGER_MS = 700; // Time between note starts in a sequence.
+const int MELODY_ECHO_TAIL_WAIT_MS = 2000; // Max wait after the last note before speech.
+const int MELODY_ECHO_INPUT_VOICES = 3;
+
+const int[] MELODY_ECHO_KEYS = {KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8};
+const string[] MELODY_ECHO_FILES = {
+	"audios/note01.wav", "audios/note02.wav", "audios/note03.wav", "audios/note04.wav",
+	"audios/note05.wav", "audios/note06.wav", "audios/note07.wav", "audios/note08.wav"
+};
+
+class melody_echo_audio {
+	sound@[] notes;
+	sound@[] input_voices;
+	int[] voice_files; // Which note file each input voice currently holds (-1 = none).
+	melody_echo_audio() {
+		notes.resize(8);
+		input_voices.resize(MELODY_ECHO_INPUT_VOICES);
+		voice_files.resize(MELODY_ECHO_INPUT_VOICES);
+		for (int i = 0; i < MELODY_ECHO_INPUT_VOICES; i++) voice_files[i] = -1;
+	}
+
+	bool load(bool[]@ latched) {
+		for (uint i = 0; i < notes.length(); i++) {
+			@notes[i] = sound();
+			if (!notes[i].load(MELODY_ECHO_FILES[i])) {
+				string failed_file = MELODY_ECHO_FILES[i];
+				close();
+				speak("Melody Echo could not load " + failed_file + ". Check that all eight note WAV files are installed beside the game resources. Returning to the menu.", true);
+				melody_echo_wait_for_error_speech(latched);
+				return false;
+			}
+		}
+		return true;
+	}
+
+	void close() {
+		close_input_voices();
+		for (uint i = 0; i < notes.length(); i++) {
+			if (@notes[i] == null) continue;
+			notes[i].stop();
+			notes[i].close();
+			@notes[i] = null;
+		}
+	}
+
+	// Start a sequence note. The same note may repeat in a sequence, so a still
+	// playing sample is simply restarted instead of treated as an error.
+	bool play_target_note(int note_id) {
+		if (note_id < 0 or note_id >= int(notes.length()) or @notes[note_id] == null) return false;
+		sound@ sample = notes[note_id];
+		if (!sample.seek(0)) return false;
+		return sample.play();
+	}
+
+	// Stop any input voice started before this response so old notes do not
+	// ring under the new ones. A plain stop keeps this path simple and robust.
+	void stop_earlier_input_voices(int attempt_index) {
+		for (int i = 0; i < attempt_index; i++) {
+			if (@input_voices[i] == null or !input_voices[i].playing) continue;
+			input_voices[i].stop();
+		}
+	}
+
+	// Play a response note on the voice reserved for this attempt position.
+	// The voice keeps its loaded file between presses, so repetition costs one
+	// seek instead of a fresh WAV load from the bundled assets.
+	bool play_input_note(int note_id, int attempt_index) {
+		if (note_id < 0 or note_id >= int(MELODY_ECHO_FILES.length())) return false;
+		if (attempt_index < 0 or attempt_index >= MELODY_ECHO_INPUT_VOICES) return false;
+		stop_earlier_input_voices(attempt_index);
+		sound@ voice = input_voices[attempt_index];
+		if (@voice != null and voice_files[attempt_index] == note_id) {
+			if (!voice.seek(0)) return false;
+			return voice.play();
+		}
+		// New file for this voice: release the old one and load once.
+		if (@voice != null) { voice.stop(); voice.close(); }
+		voice_files[attempt_index] = -1;
+		@voice = sound();
+		if (!voice.load(MELODY_ECHO_FILES[note_id])) { @input_voices[attempt_index] = null; return false; }
+		voice_files[attempt_index] = note_id;
+		@input_voices[attempt_index] = voice;
+		return voice.play();
+	}
+
+	void close_input_voices() {
+		for (uint i = 0; i < input_voices.length(); i++) {
+			if (@input_voices[i] == null) continue;
+			input_voices[i].stop();
+			input_voices[i].close();
+			@input_voices[i] = null;
+			voice_files[i] = -1;
+		}
+	}
+}
+
+enum melody_echo_attempt_result {
+	MELODY_ECHO_ATTEMPT_CANCELLED,
+	MELODY_ECHO_ATTEMPT_AUDIO_ERROR,
+	MELODY_ECHO_ATTEMPT_COMPLETE
+};
+
+bool melody_echo_escape_pressed() {
+	if (key_pressed(KEY_ESCAPE)) return true;
+	return false;
+}
+
+bool melody_echo_modifiers_down() {
+	return (keyboard_modifiers & (KEYMOD_SHIFT | KEYMOD_CTRL | KEYMOD_ALT | KEYMOD_GUI)) != 0;
+}
+
+// Consume number-key events outside the response phase and remember held keys,
+// so a key pressed/held during speech or playback cannot become an answer.
+// Latches are cleared as soon as the key is fully released, so a held key stays
+// blocked for exactly that one press and the key is usable again afterwards.
+void melody_echo_drain_keys(bool[]@ latched) {
+	for (uint i = 0; i < MELODY_ECHO_KEYS.length(); i++) {
+		int key = MELODY_ECHO_KEYS[i];
+		bool pressed = key_pressed(key);
+		bool down = key_down(key);
+		if (pressed or down) latched[i] = true;
+		else latched[i] = false;
+	}
+}
+
+void melody_echo_wait_for_error_speech(bool[]@ latched) {
+	while ((use_sr and screen_reader_has_speech() and screen_reader_is_speaking()) or ((!use_sr or !screen_reader_has_speech()) and tts.speaking)) {
+		if (melody_echo_escape_pressed()) return;
+		melody_echo_drain_keys(latched);
+		wait(5);
+	}
+}
+
+// Wait for speech to finish without blocking Escape or allowing stale note keys
+// to leak into a later phase. Speech and target samples never overlap.
+bool melody_echo_wait_for_speech(bool[]@ latched) {
+	while ((use_sr and screen_reader_has_speech() and screen_reader_is_speaking()) or ((!use_sr or !screen_reader_has_speech()) and tts.speaking)) {
+		if (melody_echo_escape_pressed()) return false;
+		melody_echo_drain_keys(latched);
+		wait(5);
+	}
+	return true;
+}
+
+// A timed wait (used for note spacing) that keeps Escape and key latching
+// working. Returns false if the user pressed Escape.
+bool melody_echo_wait_ms(int ms, bool[]@ latched) {
+	uint started = get_TIME_SYSTEM_RUNNING_MILLISECONDS();
+	while (get_TIME_SYSTEM_RUNNING_MILLISECONDS() - started < uint(ms)) {
+		if (melody_echo_escape_pressed()) return false;
+		melody_echo_drain_keys(latched);
+		wait(5);
+	}
+	return true;
+}
+
+// Wait for a sample to finish, but never longer than max_ms (0 = unlimited).
+bool melody_echo_wait_sample_capped(sound@ sample, int max_ms, bool[]@ latched) {
+	uint started = 0;
+	if (max_ms > 0) started = get_TIME_SYSTEM_RUNNING_MILLISECONDS();
+	while (sample.playing) {
+		if (melody_echo_escape_pressed()) return false;
+		melody_echo_drain_keys(latched);
+		if (max_ms > 0 and get_TIME_SYSTEM_RUNNING_MILLISECONDS() - started >= uint(max_ms)) return true;
+		wait(5);
+	}
+	return true;
+}
+
+bool melody_echo_wait_input_samples(melody_echo_audio@ audio, bool[]@ latched) {
+	while (true) {
+		bool playing = false;
+		for (uint i = 0; i < audio.input_voices.length(); i++) {
+			if (@audio.input_voices[i] != null and audio.input_voices[i].playing) playing = true;
+		}
+		if (!playing) return true;
+		if (melody_echo_escape_pressed()) return false;
+		melody_echo_drain_keys(latched);
+		wait(5);
+	}
+	return false;
+}
+
+bool melody_echo_wait_for_enter(bool[]@ latched) {
+	// Discard any confirmation press that happened on the final note/result.
+	bool enter_pressed = key_pressed(KEY_RETURN) or key_pressed(KEY_NUMPAD_ENTER);
+	bool enter_latched = enter_pressed or key_down(KEY_RETURN) or key_down(KEY_NUMPAD_ENTER);
+	while (true) {
+		if (melody_echo_escape_pressed()) return false;
+		melody_echo_drain_keys(latched);
+		bool enter_down = key_down(KEY_RETURN) or key_down(KEY_NUMPAD_ENTER);
+		enter_pressed = key_pressed(KEY_RETURN) or key_pressed(KEY_NUMPAD_ENTER);
+		if (enter_pressed) {
+			if (!enter_latched and !melody_echo_modifiers_down()) return true;
+			enter_latched = true;
+		}
+		if (!enter_down and !enter_pressed) enter_latched = false;
+		wait(5);
+	}
+	return false;
+}
+
+melody_echo_attempt_result melody_echo_collect_attempt(melody_echo_audio@ audio, int[]@ target, int[]@ attempt, bool[]@ latched) {
+	attempt.resize(0);
+	melody_echo_drain_keys(latched);
+	while (attempt.length() < target.length()) {
+		if (melody_echo_escape_pressed()) return MELODY_ECHO_ATTEMPT_CANCELLED;
+		for (uint i = 0; i < MELODY_ECHO_KEYS.length(); i++) {
+			int key = MELODY_ECHO_KEYS[i];
+			bool pressed = key_pressed(key);
+			bool down = key_down(key);
+			// Each press must be a fresh one: holding a key only registers once,
+			// and releasing it re-arms the key for the next press.
+			if (!pressed and !down) {
+				latched[i] = false;
+				continue;
+			}
+			if (latched[i]) continue;
+			latched[i] = true;
+			if (melody_echo_modifiers_down()) continue;
+			int note_id = int(i);
+			int attempt_index = int(attempt.length());
+			attempt.insert_last(note_id);
+			if (!audio.play_input_note(note_id, attempt_index)) {
+				return MELODY_ECHO_ATTEMPT_AUDIO_ERROR;
+			}
+			break;
+		}
+		wait(5);
+	}
+	return MELODY_ECHO_ATTEMPT_COMPLETE;
+}
+
+bool melody_echo_matches(int[]@ target, int[]@ attempt) {
+	if (target.length() != attempt.length()) return false;
+	for (uint i = 0; i < target.length(); i++)
+		if (target[i] != attempt[i]) return false;
+	return true;
+}
+
+void play_melody_echo() {
+	bool[] latched(8, false);
+	melody_echo_audio audio;
+	if (!audio.load(latched)) return;
+	int score = 0;
+	bool abandoned = false;
+	bool assets_ok = true;
+
+	speak("Melody Echo instructions. This is one five-round session. Each round has three notes. Listen, then repeat all of them in order with the top-row number keys 1 through 8. Key 1 is Sa, C sharp 4; 2 Re, D sharp 4; 3 Ga, F 4; 4 Ma, F sharp 4; 5 Pa, G sharp 4; 6 Dha, A sharp 4; 7 Ni, C 5; and 8 upper Sa, C sharp 5. Before the game starts you get a note practice, where pressing the keys lets you hear which note is on which key. Each round gives you three chances to repeat the exact sequence. A wrong combination repeats the same round, and failing all three chances restarts the session from round one, for a final score from zero to five. There is no time limit, and Escape abandons the session and returns to the menu. This session is not saved or resumable.", true);
+	if (!melody_echo_wait_for_speech(latched)) abandoned = true;
+	melody_echo_drain_keys(latched);
+
+	// Note practice: press the number keys freely to learn which note lives on
+	// which key. Enter starts the game; Escape returns to the menu.
+	speak("Note practice. Press the number keys one through eight to hear each note as many times as you like. Press Enter when you are ready to start the game, or Escape to return to the menu.", true);
+	if (!melody_echo_wait_for_speech(latched)) abandoned = true;
+	melody_echo_drain_keys(latched);
+	while (!abandoned and assets_ok) {
+		if (melody_echo_escape_pressed()) { abandoned = true; break; }
+		if (key_pressed(KEY_RETURN) or key_pressed(KEY_NUMPAD_ENTER)) {
+			// Wait for release, so this confirmation press cannot leak into the
+			// game's own Enter prompts later.
+			while ((key_down(KEY_RETURN) or key_down(KEY_NUMPAD_ENTER)) and !melody_echo_escape_pressed()) {
+				melody_echo_drain_keys(latched);
+				wait(5);
+			}
+			if (melody_echo_escape_pressed()) abandoned = true;
+			break;
+		}
+		for (uint i = 0; i < MELODY_ECHO_KEYS.length(); i++) {
+			int key = MELODY_ECHO_KEYS[i];
+			bool pressed = key_pressed(key);
+			bool down = key_down(key);
+			// Fresh press required: holding a key plays once, releasing re-arms.
+			if (!pressed and !down) { latched[i] = false; continue; }
+			if (latched[i]) continue;
+			latched[i] = true;
+			if (melody_echo_modifiers_down()) continue;
+			// One practice voice: a new key simply takes over from the last one.
+			if (!audio.play_input_note(int(i), 0)) {
+				assets_ok = false;
+				speak("Melody Echo could not play a note WAV sample. Returning to the menu.", true);
+				melody_echo_wait_for_error_speech(latched);
+				break;
+			}
+		}
+		wait(5);
+	}
+	melody_echo_drain_keys(latched);
+	// A practice note may still be ringing; stop the practice voice before the
+	// game's own speech and sequences begin.
+	for (uint i = 0; i < audio.input_voices.length(); i++) {
+		if (@audio.input_voices[i] == null) continue;
+		audio.input_voices[i].stop();
+	}
+
+	// Chances per round: a wrong combination repeats the same round. Three
+	// wrong attempts in one round restart the whole session from round 1.
+	int round = 1;
+	while (round <= MELODY_ECHO_ROUNDS and !abandoned and assets_ok) {
+		int[] target;
+		int[] attempt;
+		for (int i = 0; i < MELODY_ECHO_SEQUENCE_LENGTH; i++) target.insert_last(random(0, 7));
+
+		bool round_matched = false;
+		int chance = 0;
+		while (chance < MELODY_ECHO_CHANCES and !round_matched and !abandoned and assets_ok) {
+			chance++;
+			if (chance == 1) {
+				speak("Round " + round + " of " + MELODY_ECHO_ROUNDS + ". Listen to the sequence.", true);
+			} else {
+				// Wrong combination: the notice is announced here, and the same
+				// sequence is replayed so the player can try the same round again.
+				speak("Wrong combination, please try again. Chance " + chance + " of " + MELODY_ECHO_CHANCES + ". Listen to the sequence again.", true);
+			}
+			if (!melody_echo_wait_for_speech(latched)) { abandoned = true; break; }
+			melody_echo_drain_keys(latched);
+
+			// Start the whole sequence with a fixed spacing. Earlier notes are
+			// allowed to keep ringing, so this feels like a melody rather than one
+			// isolated note every few seconds.
+			for (uint i = 0; i < target.length() and !abandoned and assets_ok; i++) {
+				if (!audio.play_target_note(target[i])) {
+					speak("Melody Echo could not start " + MELODY_ECHO_FILES[target[i]] + ". Returning to the menu.", true);
+					assets_ok = false;
+					break;
+				}
+				if (i < target.length() - 1) {
+					if (!melody_echo_wait_ms(MELODY_ECHO_STAGGER_MS, latched)) abandoned = true;
+				}
+			}
+			if (!assets_ok) { melody_echo_wait_for_error_speech(latched); break; }
+			if (abandoned) break;
+
+			// Let the final note sound, but do not wait through its whole tail.
+			if (!melody_echo_wait_sample_capped(audio.notes[target[target.length() - 1]], MELODY_ECHO_TAIL_WAIT_MS, latched)) {
+				abandoned = true;
+				break;
+			}
+
+			speak("Your turn. Enter all three notes using the top-row keys one through eight.", true);
+			if (!melody_echo_wait_for_speech(latched)) { abandoned = true; break; }
+			melody_echo_attempt_result input_result = melody_echo_collect_attempt(audio, target, attempt, latched);
+			if (input_result != MELODY_ECHO_ATTEMPT_COMPLETE) {
+				if (input_result == MELODY_ECHO_ATTEMPT_CANCELLED) abandoned = true;
+				else {
+					assets_ok = false;
+					speak("Melody Echo could not play a note WAV sample. Returning to the menu.", true);
+					melody_echo_wait_for_error_speech(latched);
+				}
+				break;
+			}
+			if (!melody_echo_wait_input_samples(audio, latched)) { abandoned = true; break; }
+			// Input voices stay pooled for the whole session, later attempts and
+			// rounds replay their already loaded notes instantly.
+
+			round_matched = melody_echo_matches(target, attempt);
+			if (round_matched) {
+				score++;
+				speak("You matched the sequence.", true);
+				if (!melody_echo_wait_for_speech(latched)) { abandoned = true; break; }
+			} else if (chance >= MELODY_ECHO_CHANCES) {
+				// All three chances used unsuccessfully: restart from round 1 and
+				// reset the score for this session.
+				speak("Wrong combination. You have used all chances. The game restarts from round 1.", true);
+				if (!melody_echo_wait_for_speech(latched)) { abandoned = true; break; }
+				score = 0;
+				round = 1;
+			}
+			// Otherwise the retry notice is spoken at the top of the next pass.
+		}
+		if (!assets_ok or abandoned) break;
+		if (round_matched and round < MELODY_ECHO_ROUNDS) {
+			speak("Press Enter to continue to round " + (round + 1) + " of " + MELODY_ECHO_ROUNDS + ", or Escape to abandon the session.", true);
+			if (!melody_echo_wait_for_speech(latched)) abandoned = true;
+			else if (!melody_echo_wait_for_enter(latched)) { abandoned = true; stop_speech(); }
+		}
+		if (abandoned or !assets_ok) break;
+		if (round_matched) round++; // A restarted session was already set to round 1.
+	}
+
+	if (!abandoned and assets_ok) {
+		speak("Session complete. You matched " + score + " out of " + MELODY_ECHO_ROUNDS + " rounds.", true);
+		if (melody_echo_wait_for_speech(latched)) {
+			speak("Press Enter to return to the main menu, or Escape to return now.", true);
+			if (melody_echo_wait_for_speech(latched) and !melody_echo_wait_for_enter(latched)) stop_speech();
+		}
+	}
+	if (abandoned) stop_speech();
+	audio.close();
+}

@@ -57,6 +57,13 @@
 /music/*
 !/music/.gitkeep
 
+# --- The audios folder (Melody Echo note recordings): same policy as /music/ ---
+# note01.wav..note08.wav are external, user-provided recordings. Only the
+# .gitkeep placeholder is tracked so fresh clones keep the folder and the
+# #pragma asset "audios" line can embed it when the files are placed locally.
+/audios/*
+!/audios/.gitkeep
+
 # --- Distribution bundles ---
 # Built zips are release artifacts and have contained audio in the past;
 # they are never committed.
